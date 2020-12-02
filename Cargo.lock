@@ -892,6 +892,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "heap_eval"
+version = "0.1.0"
+dependencies = [
+ "apic",
+ "getopts",
+ "hashbrown",
+ "heap",
+ "hpet",
+ "libtest",
+ "log",
+ "qp-trie",
+ "runqueue",
+ "spawn",
+ "terminal_print",
+]
+
+[[package]]
 name = "heapfile"
 version = "0.1.0"
 dependencies = [

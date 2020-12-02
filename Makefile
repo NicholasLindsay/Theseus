@@ -558,7 +558,8 @@ $(error Error: the 'kvm=yes' option is currently broken. Use 'host=yes' instead"
 	# QEMU_FLAGS += -accel kvm
 endif
 
-
+## Experimental: use VNC server (NOT SECURE)
+QEMU_FLAGS += -vnc :1
 
 ###################################################################################################
 ### This section has targets for running and debugging 
