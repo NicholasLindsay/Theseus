@@ -127,7 +127,7 @@ impl Mapper {
     /// Maps the given `AllocatedPages` to the given physical frames.
     /// 
     /// Consumes the given `AllocatedPages` and returns a `MappedPages` object which contains those `AllocatedPages`.
-    pub fn map_allocated_pages_to<A>(&mut self, pages: AllocatedPages, frames: FrameRange, flags: EntryFlags, allocator: &mut A)
+    pub fn map_allocated_pages_to<A>(&mut self, pages: AllocatedPages<'static>, frames: FrameRange, flags: EntryFlags, allocator: &mut A)
         -> Result<MappedPages, &'static str>
         where A: FrameAllocator
     {
@@ -170,7 +170,7 @@ impl Mapper {
     /// Maps the given `AllocatedPages` to randomly chosen (allocated) physical frames.
     /// 
     /// Consumes the given `AllocatedPages` and returns a `MappedPages` object which contains those `AllocatedPages`.
-    pub fn map_allocated_pages<A>(&mut self, pages: AllocatedPages, flags: EntryFlags, allocator: &mut A)
+    pub fn map_allocated_pages<A>(&mut self, pages: AllocatedPages<'static>, flags: EntryFlags, allocator: &mut A)
         -> Result<MappedPages, &'static str>
         where A: FrameAllocator
     {
@@ -219,7 +219,7 @@ pub struct MappedPages {
     /// The Frame containing the top-level P4 page table that this MappedPages was originally mapped into. 
     page_table_p4: Frame,
     /// The range of allocated virtual pages contained by this mapping.
-    pages: AllocatedPages,
+    pages: AllocatedPages<'static>,
     // The EntryFlags that define the page permissions of this mapping
     flags: EntryFlags,
 }
@@ -354,6 +354,8 @@ impl MappedPages {
             let frame = p1[page.p1_index()].pointed_frame().ok_or("remap(): page not mapped")?;
             p1[page.p1_index()].set(frame, new_flags | EntryFlags::PRESENT);
 
+            // TODO: only need to flush when permissions downgraded (i.e when
+            // going from Read-Write to Read only) and not in the general case
             tlb_flush_virt_addr(page.start_address());
         }
         

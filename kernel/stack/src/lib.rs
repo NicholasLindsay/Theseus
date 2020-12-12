@@ -39,7 +39,7 @@ pub fn alloc_stack<FA>(
 /// `pages` is the combined `AllocatedPages` object that holds
 /// the guard page followed by the actual stack pages to be mapped.
 fn inner_alloc_stack<FA>(
-    pages: AllocatedPages,
+    pages: AllocatedPages<'static>,
     page_table: &mut Mapper, 
     frame_allocator_ref: &FrameAllocatorRef<FA>,
 ) -> Option<Stack> where FA: FrameAllocator {
@@ -75,7 +75,7 @@ fn inner_alloc_stack<FA>(
 /// A stack is backed by and auto-derefs into `MappedPages`. 
 #[derive(Debug)]
 pub struct Stack {
-    guard_page: AllocatedPages,
+    guard_page: AllocatedPages<'static>,
     pages: MappedPages,
 }
 impl Deref for Stack {
@@ -124,9 +124,9 @@ impl Stack {
     /// If the conditions are not met, 
     /// an `Err` containing the given `guard_page` and `stack_pages` is returned.
     pub fn from_pages(
-        guard_page: AllocatedPages,
+        guard_page: AllocatedPages<'static>,
         stack_pages: MappedPages
-    ) -> Result<Stack, (AllocatedPages, MappedPages)> {
+    ) -> Result<Stack, (AllocatedPages<'static>, MappedPages)> {
         if (*guard_page.end() + 1) == *stack_pages.start() 
             && stack_pages.flags().is_writable()
         {

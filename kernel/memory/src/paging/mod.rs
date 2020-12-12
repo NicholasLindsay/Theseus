@@ -190,7 +190,7 @@ pub fn init(
         MappedPages,
         MappedPages,
         MappedPages,
-        (AllocatedPages, MappedPages),
+        (AllocatedPages<'static>, MappedPages),
         [Option<MappedPages>; 32],
         [Option<MappedPages>; 32]
     ), &'static str>

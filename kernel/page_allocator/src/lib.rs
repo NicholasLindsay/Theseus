@@ -78,9 +78,16 @@ struct Chunk {
 	pages: PageRange,
 }
 impl Chunk {
-	fn as_allocated_pages(&self) -> AllocatedPages {
+	fn as_allocated_pages<'list>(&self, 
+								free_list: &'list Mutex<StaticArrayLinkedList<Chunk>>, 
+								allocated_list: &'list Mutex<StaticArrayLinkedList<Chunk>>) 
+								-> AllocatedPages<'list> {
 		AllocatedPages {
 			pages: self.pages.clone(),
+			// TODO: are we sure we want to add references to free/allocated
+			// lists here, since they are handled seperately?
+			free_list: free_list,
+			allocated_list: allocated_list
 		}
 	}
 
@@ -110,27 +117,60 @@ impl Deref for Chunk {
 /// if this object falls out of scope, its allocated pages will be auto-deallocated upon drop. 
 /// 
 /// TODO: implement proper deallocation for `AllocatedPages` upon drop.
-pub struct AllocatedPages {
+pub struct AllocatedPages<'list> {
+	/// The allocated `VirtualAddress`es corresponding to this allocation.
 	pages: PageRange,
+	/// A reference to the list into which we will insert the freed `Chunk` when this allocation is
+	/// dropped.
+	free_list: &'list Mutex<StaticArrayLinkedList<Chunk>>,
+	/// A reference to the list into which we will remove the allocated `Chunk` when this 
+	/// allocation is dropped.
+	allocated_list: &'list Mutex<StaticArrayLinkedList<Chunk>>,
 }
-impl Deref for AllocatedPages {
+impl<'list> Deref for AllocatedPages<'list> {
     type Target = PageRange;
     fn deref(&self) -> &PageRange {
         &self.pages
     }
 }
-impl fmt::Debug for AllocatedPages {
+impl<'list> fmt::Debug for AllocatedPages<'list> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		write!(f, "AllocatedPages({:?})", self.pages)
 	}
 }
+impl<'list> Drop for AllocatedPages<'list> {
+	fn drop(&mut self) {
+		let mut locked_list = self.free_list.lock();
+		let mut deallocated = false;
 
-impl AllocatedPages {
+		for c in locked_list.iter_mut() {
+			if c.pages == self.pages {
+				// info!("Deallocating pages {:?} thru {:?}", *c.pages.start(), *c.pages.end());
+				c.allocated = false;
+				deallocated = true;
+				break;
+			}
+		}
+
+		if !deallocated {
+			info!("Did not find page to deallocate!");
+		}
+		else {
+			info!("Found page to deallocate!");
+		}
+	}
+}
+
+impl<'list> AllocatedPages<'list> {
 	/// Returns an empty AllocatedPages object that performs no page allocation. 
     /// Can be used as a placeholder, but will not permit any real usage. 
-    pub const fn empty() -> AllocatedPages {
+    pub fn empty() -> AllocatedPages<'list> {
+		let free_list = &FREE_PAGE_LIST;
+		let allocated_list = &FREE_PAGE_LIST;
         AllocatedPages {
-			pages: PageRange::empty()
+			pages: PageRange::empty(),
+			free_list: free_list,
+			allocated_list: allocated_list,
 		}
 	}
 
@@ -141,7 +181,9 @@ impl AllocatedPages {
 	/// that is, `self.end` must equal `ap.start`. 
 	/// If this condition is met, `self` is modified and `Ok(())` is returned,
 	/// otherwise `Err(ap)` is returned.
-	pub fn merge(&mut self, ap: AllocatedPages) -> Result<(), AllocatedPages> {
+	pub fn merge(&mut self, ap: AllocatedPages<'list>) -> Result<(), AllocatedPages<'list>> {
+		// TODO: make sure objects share same allocated and free lists
+
 		// make sure the pages are contiguous
 		if *ap.start() != (*self.end() + 1) {
 			return Err(ap);
@@ -160,14 +202,16 @@ impl AllocatedPages {
 	/// returned `AllocatedPages` objects may be empty. 
 	/// 
 	/// Returns `None` if `at_page` is not within the bounds of this `AllocatedPages`.
-	pub fn split(self, at_page: Page) -> Option<(AllocatedPages, AllocatedPages)> {
+	pub fn split(self, at_page: Page) -> Option<(AllocatedPages<'list>, AllocatedPages<'list>)> {
 		let end_of_first = at_page - 1;
 		if at_page > *self.pages.start() && end_of_first <= *self.pages.end() {
-			let first  = PageRange::new(*self.pages.start(), end_of_first);
-			let second = PageRange::new(at_page, *self.pages.end());
+			let first          = PageRange::new(*self.pages.start(), end_of_first);
+			let second         = PageRange::new(at_page, *self.pages.end());
+			let free_list      = self.free_list;
+			let allocated_list = self.allocated_list;
 			Some((
-				AllocatedPages { pages: first }, 
-				AllocatedPages { pages: second },
+				AllocatedPages { pages: first, free_list: free_list, allocated_list: allocated_list}, 
+				AllocatedPages { pages: second, free_list: free_list, allocated_list: allocated_list },
 			))
 		} else {
 			None
@@ -376,7 +420,7 @@ impl<'list> Drop for DeferredAllocAction<'list> {
 pub fn allocate_pages_deferred(
 	requested_vaddr: Option<VirtualAddress>,
 	num_pages: usize,
-) -> Result<(AllocatedPages, DeferredAllocAction<'static>), &'static str> {
+) -> Result<(AllocatedPages<'static>, DeferredAllocAction<'static>), &'static str> {
 	if num_pages == 0 {
 		warn!("PageAllocator: requested an allocation of 0 pages... stupid!");
 		return Err("cannot allocate zero pages");
@@ -415,7 +459,7 @@ pub fn allocate_pages_deferred(
 		if num_pages == c.pages.size_in_pages() {
 			c.allocated = true;
 			return Ok((
-				c.as_allocated_pages(),
+				c.as_allocated_pages(&FREE_PAGE_LIST, &FREE_PAGE_LIST),
 				DeferredAllocAction::new(None, None, None),
 			));
 		}
@@ -451,7 +495,7 @@ pub fn allocate_pages_deferred(
 			pages: extra_free_pages,
 		};
 		return Ok((
-			allocated_chunk.as_allocated_pages(),
+			allocated_chunk.as_allocated_pages(&FREE_PAGE_LIST, &FREE_PAGE_LIST),
 			DeferredAllocAction::new(allocated_chunk, extra_free_chunk, None),
 		));
 	}
@@ -470,7 +514,7 @@ pub fn allocate_pages_deferred(
 pub fn allocate_pages_by_bytes_deferred(
 	requested_vaddr: Option<VirtualAddress>,
 	num_bytes: usize,
-) -> Result<(AllocatedPages, DeferredAllocAction<'static>), &'static str> {
+) -> Result<(AllocatedPages<'static>, DeferredAllocAction<'static>), &'static str> {
 	let actual_num_bytes = if let Some(vaddr) = requested_vaddr {
 		num_bytes + (vaddr.value() % PAGE_SIZE)
 	} else {
@@ -484,7 +528,7 @@ pub fn allocate_pages_by_bytes_deferred(
 /// Allocates the given number of pages with no constraints on the starting virtual address.
 /// 
 /// See [`allocate_pages_deferred()`](fn.allocate_pages_deferred.html) for more details. 
-pub fn allocate_pages(num_pages: usize) -> Option<AllocatedPages> {
+pub fn allocate_pages(num_pages: usize) -> Option<AllocatedPages<'static>> {
 	allocate_pages_deferred(None, num_pages)
 		.map(|(ap, _action)| ap)
 		.ok()
@@ -496,7 +540,7 @@ pub fn allocate_pages(num_pages: usize) -> Option<AllocatedPages> {
 /// 
 /// This function still allocates whole pages by rounding up the number of bytes. 
 /// See [`allocate_pages_deferred()`](fn.allocate_pages_deferred.html) for more details. 
-pub fn allocate_pages_by_bytes(num_bytes: usize) -> Option<AllocatedPages> {
+pub fn allocate_pages_by_bytes(num_bytes: usize) -> Option<AllocatedPages<'static>> {
 	allocate_pages_by_bytes_deferred(None, num_bytes)
 		.map(|(ap, _action)| ap)
 		.ok()
@@ -507,7 +551,7 @@ pub fn allocate_pages_by_bytes(num_bytes: usize) -> Option<AllocatedPages> {
 /// 
 /// This function still allocates whole pages by rounding up the number of bytes. 
 /// See [`allocate_pages_deferred()`](fn.allocate_pages_deferred.html) for more details. 
-pub fn allocate_pages_by_bytes_at(vaddr: VirtualAddress, num_bytes: usize) -> Result<AllocatedPages, &'static str> {
+pub fn allocate_pages_by_bytes_at(vaddr: VirtualAddress, num_bytes: usize) -> Result<AllocatedPages<'static>, &'static str> {
 	allocate_pages_by_bytes_deferred(Some(vaddr), num_bytes)
 		.map(|(ap, _action)| ap)
 }
@@ -516,7 +560,7 @@ pub fn allocate_pages_by_bytes_at(vaddr: VirtualAddress, num_bytes: usize) -> Re
 /// Allocates the given number of pages starting at (inclusive of) the page containing the given `VirtualAddress`.
 /// 
 /// See [`allocate_pages_deferred()`](fn.allocate_pages_deferred.html) for more details. 
-pub fn allocate_pages_at(vaddr: VirtualAddress, num_pages: usize) -> Result<AllocatedPages, &'static str> {
+pub fn allocate_pages_at(vaddr: VirtualAddress, num_pages: usize) -> Result<AllocatedPages<'static>, &'static str> {
 	allocate_pages_deferred(Some(vaddr), num_pages)
 		.map(|(ap, _action)| ap)
 }

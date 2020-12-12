@@ -532,7 +532,7 @@ unsafe impl Step for Page {
 
 
 /// An inclusive range of `Page`s that are contiguous in virtual memory.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct PageRange(RangeInclusive<Page>);
 
 impl PageRange {
