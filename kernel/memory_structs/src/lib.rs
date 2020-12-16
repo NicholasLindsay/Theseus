@@ -440,6 +440,13 @@ impl fmt::Debug for Page {
 }
 
 impl Page {
+    /// Create a new `Page` given a virtual page `number`.
+    pub const fn new(number: usize) -> Page {
+        Page {
+            number: number,
+        }
+    }
+
     /// Returns the `Page` that contains the given `VirtualAddress`.
     pub const fn containing_address(virt_addr: VirtualAddress) -> Page {
         Page {

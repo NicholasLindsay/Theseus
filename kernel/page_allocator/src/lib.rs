@@ -10,6 +10,7 @@
 //! but there are several convenience functions that offer simpler interfaces for general usage. 
 
 #![no_std]
+#![feature(const_panic)]
 
 extern crate alloc;
 #[macro_use] extern crate log;
@@ -26,6 +27,7 @@ use kernel_config::memory::*;
 use memory_structs::{VirtualAddress, Page, PageRange};
 use spin::Mutex;
 
+mod buddy;
 
 /// The single, system-wide list of free virtual memory pages.
 /// Currently this list includes both free and allocated chunks of pages together in the same list,
@@ -68,6 +70,8 @@ static FREE_PAGE_LIST: Mutex<StaticArrayLinkedList<Chunk>> = Mutex::new(StaticAr
 	None, None, None, None, None, None, None, None,
 ]));
 
+/// TODO: Buddy allocator
+static BUDDY_ALLOCATOR: buddy::buddy_allocator = buddy::buddy_allocator::new(0x80000000, 4);
 
 /// A range of contiguous pages and whether they're allocated or free.
 #[derive(Debug, Clone)]
@@ -86,8 +90,9 @@ impl Chunk {
 			pages: self.pages.clone(),
 			// TODO: are we sure we want to add references to free/allocated
 			// lists here, since they are handled seperately?
-			free_list: free_list,
-			allocated_list: allocated_list
+			metadata: PageAllocationMeta::ChunkAllocator {free_list, allocated_list},
+//			free_list: free_list,
+//			allocated_list: allocated_list
 		}
 	}
 
@@ -106,7 +111,25 @@ impl Deref for Chunk {
     }
 }
 
-
+/// There can be potentially more than one source of page allocation (for
+/// example, a simple Chunk allocator and a buddy allocator). Each allocation
+/// has metadata specific to the source in order to perform the proper
+/// bookkeeping when that `AllocatedPages` object is freed. In the future,
+/// we may wish to use polymorphism to implement this. For now though, we can
+/// emulate a `Union` type using Rust `Enum`s.
+enum PageAllocationMeta<'list> {
+	/// Linked list "Chunk" allocator
+	ChunkAllocator {
+		/// A reference to the list into which we will insert the freed `Chunk`
+		/// when this allocation is dropped.
+		free_list:      &'list Mutex<StaticArrayLinkedList<Chunk>>,
+		/// A reference to the list into which we will remove the allocated `Chunk` when this 
+		/// allocation is dropped.		
+		allocated_list: &'list Mutex<StaticArrayLinkedList<Chunk>>
+	},
+	/// Dynamic "Buddy" allocator (TODO)
+	BuddyAllocator,
+}
 
 /// Represents a range of allocated `VirtualAddress`es, specified in `Page`s. 
 /// 
@@ -120,12 +143,9 @@ impl Deref for Chunk {
 pub struct AllocatedPages<'list> {
 	/// The allocated `VirtualAddress`es corresponding to this allocation.
 	pages: PageRange,
-	/// A reference to the list into which we will insert the freed `Chunk` when this allocation is
-	/// dropped.
-	free_list: &'list Mutex<StaticArrayLinkedList<Chunk>>,
-	/// A reference to the list into which we will remove the allocated `Chunk` when this 
-	/// allocation is dropped.
-	allocated_list: &'list Mutex<StaticArrayLinkedList<Chunk>>,
+	/// Metadata for the allocator that allocated this object. In the future,
+	/// we may use polymorphism instead.
+	metadata: PageAllocationMeta<'list>,
 }
 impl<'list> Deref for AllocatedPages<'list> {
     type Target = PageRange;
@@ -138,25 +158,37 @@ impl<'list> fmt::Debug for AllocatedPages<'list> {
 		write!(f, "AllocatedPages({:?})", self.pages)
 	}
 }
+
+/// Drop the `AllocatedPages` object, releasing the pages back to the underlying
+/// allocator. For now, we remember the underlying allocator using a Rust `Enum`
+/// type. In the future we may wish to use polymorphism instead.
 impl<'list> Drop for AllocatedPages<'list> {
 	fn drop(&mut self) {
-		let mut locked_list = self.free_list.lock();
-		let mut deallocated = false;
-
-		for c in locked_list.iter_mut() {
-			if c.pages == self.pages {
-				// info!("Deallocating pages {:?} thru {:?}", *c.pages.start(), *c.pages.end());
-				c.allocated = false;
-				deallocated = true;
-				break;
+		match self.metadata {
+			PageAllocationMeta::ChunkAllocator {free_list, allocated_list} => {
+				info!("Drop ChunkAllocator");
+				let mut locked_list = free_list.lock();
+				let mut deallocated = false;
+		
+				for c in locked_list.iter_mut() {
+					if c.pages == self.pages {
+						// info!("Deallocating pages {:?} thru {:?}", *c.pages.start(), *c.pages.end());
+						c.allocated = false;
+						deallocated = true;
+						break;
+					}
+				}
+		
+				if !deallocated {
+					info!("Did not find page to deallocate!");
+				}
+				else {
+					info!("Found page to deallocate!");
+				}
 			}
-		}
-
-		if !deallocated {
-			info!("Did not find page to deallocate!");
-		}
-		else {
-			info!("Found page to deallocate!");
+			PageAllocationMeta::BuddyAllocator => {
+				info!("Drop BuddyAllocator");
+			}
 		}
 	}
 }
@@ -169,8 +201,9 @@ impl<'list> AllocatedPages<'list> {
 		let allocated_list = &FREE_PAGE_LIST;
         AllocatedPages {
 			pages: PageRange::empty(),
-			free_list: free_list,
-			allocated_list: allocated_list,
+			metadata: PageAllocationMeta::ChunkAllocator{free_list, allocated_list},
+//			free_list: free_list,
+//			allocated_list: allocated_list,
 		}
 	}
 
@@ -182,16 +215,32 @@ impl<'list> AllocatedPages<'list> {
 	/// If this condition is met, `self` is modified and `Ok(())` is returned,
 	/// otherwise `Err(ap)` is returned.
 	pub fn merge(&mut self, ap: AllocatedPages<'list>) -> Result<(), AllocatedPages<'list>> {
-		// TODO: make sure objects share same allocated and free lists
+		// TODO: this match statement is very clumsy: we should refactor the code to avoid this
+		match self.metadata {
+			PageAllocationMeta::BuddyAllocator => {
+				unimplemented!();
+			}
+			PageAllocationMeta::ChunkAllocator {free_list, allocated_list} => {
+				match ap.metadata {
+					PageAllocationMeta::BuddyAllocator => {
+						panic!("Cannot merge Buddy and Chunk allocations");
+					}
+					// Implicitly check that the free_list and allocated_list match
+					PageAllocationMeta::ChunkAllocator {free_list, allocated_list} => {
+						info!("Assuming merged chunks share free/allocated lists");
 
-		// make sure the pages are contiguous
-		if *ap.start() != (*self.end() + 1) {
-			return Err(ap);
+						// make sure the pages are contiguous
+						if *ap.start() != (*self.end() + 1) {
+							return Err(ap);
+						}
+						self.pages = PageRange::new(*self.start(), *ap.end());
+						// ensure the now-merged AllocatedPages doesn't run its drop handler and free its pages.
+						core::mem::forget(ap); 
+						Ok(())
+					}
+				}
+			}
 		}
-		self.pages = PageRange::new(*self.start(), *ap.end());
-		// ensure the now-merged AllocatedPages doesn't run its drop handler and free its pages.
-		core::mem::forget(ap); 
-		Ok(())
 	}
 
 	/// Splits this `AllocatedPages` into two separate `AllocatedPages` objects:
@@ -203,19 +252,26 @@ impl<'list> AllocatedPages<'list> {
 	/// 
 	/// Returns `None` if `at_page` is not within the bounds of this `AllocatedPages`.
 	pub fn split(self, at_page: Page) -> Option<(AllocatedPages<'list>, AllocatedPages<'list>)> {
-		let end_of_first = at_page - 1;
-		if at_page > *self.pages.start() && end_of_first <= *self.pages.end() {
-			let first          = PageRange::new(*self.pages.start(), end_of_first);
-			let second         = PageRange::new(at_page, *self.pages.end());
-			let free_list      = self.free_list;
-			let allocated_list = self.allocated_list;
-			Some((
-				AllocatedPages { pages: first, free_list: free_list, allocated_list: allocated_list}, 
-				AllocatedPages { pages: second, free_list: free_list, allocated_list: allocated_list },
-			))
-		} else {
-			None
+		// TODO: Make this less clumsy
+		match self.metadata {
+			PageAllocationMeta::ChunkAllocator {free_list, allocated_list} => {
+				let end_of_first = at_page - 1;
+				if at_page > *self.pages.start() && end_of_first <= *self.pages.end() {
+					let first          = PageRange::new(*self.pages.start(), end_of_first);
+					let second         = PageRange::new(at_page, *self.pages.end());
+					Some((
+						AllocatedPages { pages: first, metadata: PageAllocationMeta::ChunkAllocator {free_list, allocated_list}}, 
+						AllocatedPages { pages: second, metadata: PageAllocationMeta::ChunkAllocator {free_list, allocated_list}},
+					))
+				} else {
+					None
+				}
+			}
+			PageAllocationMeta::BuddyAllocator => {
+				panic!("Buddy allocator does not implement split()!");
+			}
 		}
+
 	}
 }
 
